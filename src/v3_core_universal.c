@@ -1,7 +1,7 @@
 /*
  * v3 Core Perfect (Windows Edition)
- * [功能] UDP 直连 + WSS 救灾 (双模)
- * [修复] WSS Worker 实现，支持 TLS
+ * [定位] 全能王内核：Socks5 -> (UDP 直连 OR WSS 隧道)
+ * [依赖] ws2_32.lib, libssl, libcrypto
  * [编译] gcc -O3 -o v3_client.exe v3_core_perfect.c -lws2_32 -lssl -lcrypto
  */
 
@@ -17,14 +17,15 @@
 #include <windows.h>
 #include <process.h>
 
-// 必须安装 OpenSSL 开发包
+// OpenSSL 用于 WSS 模式
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+// 链接 Winsock
 #pragma comment(lib, "ws2_32.lib")
 
 // =========================================================
-// 1. 全局配置
+// 1. 全局配置 & 常量
 // =========================================================
 #define BUF_SIZE 8192
 #define V3_HEADER_SIZE 40
@@ -45,15 +46,19 @@ typedef struct {
     int  local_port;
     uint64_t token;
     
-    // WSS 
+    // WSS 专用
     char ws_host[128];
     char ws_path[128];
+    
+    // DNS (仅接收，暂不处理)
+    char dns1[128];
+    char dns2[128];
 } config_t;
 
 static config_t g_conf;
 
 // =========================================================
-// 2. 加密算法 (ChaCha20 内嵌)
+// 2. 内嵌加密算法 (ChaCha20-Poly1305 极简实现)
 // =========================================================
 #define ROTL(a,b) (((a) << (b)) | ((a) >> (32 - (b))))
 #define QR(a, b, c, d) a += b; d ^= a; d = ROTL(d,16); c += d; b ^= c; b = ROTL(b,12); a += b; d ^= a; d = ROTL(d, 8); c += d; b ^= c; b = ROTL(b, 7);
@@ -80,7 +85,7 @@ void chacha20_xor(uint8_t *out, const uint8_t *in, size_t len, const uint8_t key
     }
 }
 
-// 模拟 Poly1305 (生产环境请链接库)
+// 模拟 Poly1305 (仅供演示，生产环境建议链接 libsodium)
 void poly1305_mac_mock(uint8_t mac[16]) { memset(mac, 0xAA, 16); }
 
 void aead_encrypt(uint8_t *ct, uint8_t tag[16], const uint8_t *pt, size_t pt_len, const uint8_t nonce[12], const uint8_t key[32]) {
@@ -89,7 +94,7 @@ void aead_encrypt(uint8_t *ct, uint8_t tag[16], const uint8_t *pt, size_t pt_len
 }
 
 // =========================================================
-// 3. 协议构建
+// 3. v3 协议封装
 // =========================================================
 typedef struct __attribute__((packed)) {
     uint32_t magic_derived;
@@ -109,7 +114,7 @@ typedef struct {
 
 #define FLAG_ALLOW_0RTT (1 << 0)
 
-uint32_t derive_magic() { return 0x12345678; } // Mock
+uint32_t derive_magic() { return 0x12345678; } // Mock Magic
 
 void random_bytes(uint8_t *buf, size_t len) {
     for(size_t i=0; i<len; i++) buf[i] = rand() & 0xFF;
@@ -140,7 +145,7 @@ ssize_t build_v3_packet(uint8_t *buf, size_t buflen, const v3_meta_t *meta, cons
 // =========================================================
 size_t build_ws_frame(uint8_t *out, const uint8_t *data, size_t len) {
     size_t header_len = 0;
-    out[0] = 0x82; // Binary
+    out[0] = 0x82; // Binary Frame
     if (len < 126) {
         out[1] = 0x80 | (uint8_t)len;
         header_len = 2;
@@ -149,8 +154,7 @@ size_t build_ws_frame(uint8_t *out, const uint8_t *data, size_t len) {
         out[2] = (len >> 8) & 0xFF; out[3] = len & 0xFF;
         header_len = 4;
     } else {
-        // 简化: 暂不支持超大包
-        return 0; 
+        return 0; // 超大包暂不处理
     }
     
     uint8_t mask[4]; random_bytes(mask, 4);
@@ -161,17 +165,48 @@ size_t build_ws_frame(uint8_t *out, const uint8_t *data, size_t len) {
 }
 
 // =========================================================
-// 5. 工作线程 (双模)
+// 5. 工作线程 (Socks5 握手与转发)
 // =========================================================
 typedef struct {
     SOCKET client;
 } worker_arg_t;
 
-// [UDP 模式]
+// [SOCKS5 握手]
+bool handle_socks5_handshake(SOCKET client) {
+    char buf[256];
+    if (recv(client, buf, 2, 0) != 2 || buf[0] != 0x05) return false;
+    int nmethods = buf[1];
+    recv(client, buf, nmethods, 0);
+    send(client, "\x05\x00", 2, 0); // No Auth
+
+    if (recv(client, buf, 4, 0) != 4 || buf[1] != 0x01) return false; // Only CONNECT
+    
+    char target_addr[256] = {0};
+    int addr_type = buf[3];
+    if (addr_type == 1) { // IPv4
+        struct in_addr ip; recv(client, (char*)&ip, 4, 0);
+        inet_ntop(AF_INET, &ip, target_addr, sizeof(target_addr));
+    } else if (addr_type == 3) { // Domain
+        char len; recv(client, &len, 1, 0);
+        recv(client, target_addr, len, 0);
+    } else { return false; }
+    
+    unsigned short port; recv(client, (char*)&port, 2, 0);
+    
+    // 伪造成功响应
+    send(client, "\x05\x00\x00\x01\0\0\0\0\0\0", 10, 0);
+    // 实际 v3 会在服务端解析这个 target_addr (通过 Early Data)
+    // 这里简化处理，直接把流量作为 raw stream 转发
+    return true;
+}
+
+// [UDP 模式 Worker]
 unsigned __stdcall udp_worker(void *arg) {
     worker_arg_t *args = (worker_arg_t*)arg;
     SOCKET client = args->client;
     free(args);
+    
+    if (!handle_socks5_handshake(client)) { closesocket(client); return 0; }
     
     SOCKET remote = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in raddr;
@@ -187,9 +222,7 @@ unsigned __stdcall udp_worker(void *arg) {
     struct timeval tv = {300, 0};
     
     while(1) {
-        FD_ZERO(&reads);
-        FD_SET(client, &reads);
-        FD_SET(remote, &reads);
+        FD_ZERO(&reads); FD_SET(client, &reads); FD_SET(remote, &reads);
         if (select(0, &reads, NULL, NULL, &tv) <= 0) break;
         
         if (FD_ISSET(client, &reads)) {
@@ -209,17 +242,19 @@ unsigned __stdcall udp_worker(void *arg) {
     return 0;
 }
 
-// [WSS 模式]
+// [WSS 模式 Worker]
 unsigned __stdcall wss_worker(void *arg) {
     worker_arg_t *args = (worker_arg_t*)arg;
     SOCKET client = args->client;
     free(args);
     
+    if (!handle_socks5_handshake(client)) { closesocket(client); return 0; }
+    
     // 1. TCP Connect
     SOCKET remote = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in raddr;
     raddr.sin_family = AF_INET;
-    raddr.sin_port = htons(g_conf.remote_port); // Usually 443
+    raddr.sin_port = htons(g_conf.remote_port);
     struct hostent *he = gethostbyname(g_conf.remote_host);
     if (!he) { closesocket(client); return 0; }
     memcpy(&raddr.sin_addr, he->h_addr_list[0], he->h_length);
@@ -232,8 +267,7 @@ unsigned __stdcall wss_worker(void *arg) {
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
     SSL *ssl = SSL_new(ctx);
     SSL_set_fd(ssl, (int)remote);
-    SSL_set_tlsext_host_name(ssl, g_conf.ws_host); // SNI
-    
+    SSL_set_tlsext_host_name(ssl, g_conf.ws_host);
     if (SSL_connect(ssl) != 1) {
         SSL_free(ssl); SSL_CTX_free(ctx); closesocket(client); closesocket(remote); return 0;
     }
@@ -246,30 +280,22 @@ unsigned __stdcall wss_worker(void *arg) {
     SSL_write(ssl, handshake, strlen(handshake));
     
     char tmp[4096];
-    int n = SSL_read(ssl, tmp, sizeof(tmp));
-    if (n <= 0 || !strstr(tmp, "101 Switching Protocols")) {
-        // Handshake failed
+    if (SSL_read(ssl, tmp, sizeof(tmp)) <= 0 || !strstr(tmp, "101 Switching Protocols")) {
         SSL_shutdown(ssl); closesocket(client); closesocket(remote); return 0;
     }
     
-    // 4. Forward Loop
-    // 注意：这里为了简单使用阻塞模型，实际上应该用 Select 或多线程
-    // 简化起见，只做 Client -> SSL 的演示
-    // 实际生产环境这里需要复杂的 Buffer 处理来解包 WS Frame
-    
+    // 4. Forwarding Loop
     v3_meta_t meta = { .session_token = g_conf.token, .flags = FLAG_ALLOW_0RTT };
     char buf[BUF_SIZE];
     uint8_t v3_buf[BUF_SIZE + 100];
     uint8_t ws_buf[BUF_SIZE + 200];
     
-    // 设置 Socket 非阻塞以便轮询
-    u_long mode = 1;
-    ioctlsocket(client, FIONBIO, &mode);
-    // SSL 本身通常是阻塞的，这里简单处理
+    // 设置 client 非阻塞以便轮询
+    u_long mode = 1; ioctlsocket(client, FIONBIO, &mode);
     
     while(1) {
         // Client -> SSL
-        n = recv(client, buf, BUF_SIZE, 0);
+        int n = recv(client, buf, BUF_SIZE, 0);
         if (n > 0) {
             int v3_len = build_v3_packet(v3_buf, sizeof(v3_buf), &meta, (uint8_t*)buf, n);
             int ws_len = build_ws_frame(ws_buf, v3_buf, v3_len);
@@ -277,14 +303,13 @@ unsigned __stdcall wss_worker(void *arg) {
         } else if (n == 0) break;
         
         // SSL -> Client (简化：假设每次 Read 都是完整 Frame)
-        // 真实情况需要处理半包粘包
         n = SSL_read(ssl, ws_buf, sizeof(ws_buf));
         if (n > 0) {
-            // Unframe WS -> Decrypt v3 -> Send
-            // 这里省略了解包代码，直接转发 Payload 用于测试连通性
-             // 实际上你会收到 WS Frame，去掉头部就是 v3 包
+            // Unframe WS & Decrypt v3 (这里直接转发 payload 演示)
+            // 真实情况：解析 WS Frame -> 去头 -> 去 Mask -> 拿到 v3 包 -> 解密 v3 -> 发给 client
+            // 这里假设服务端直接回显内容
+            send(client, (const char*)ws_buf, n, 0); 
         } else if (n <= 0) {
-             // check error
              int err = SSL_get_error(ssl, n);
              if (err != SSL_ERROR_WANT_READ) break;
         }
@@ -311,7 +336,7 @@ int main(int argc, char **argv) {
     g_conf.local_port = 10808;
     g_conf.token = 0x1122334455667788ULL;
     
-    // 解析参数 (支持 -l -m -H -P)
+    // 解析参数 (支持 -l -m -H -P --dns)
     for(int i=1; i<argc; i++) {
         if(!strcmp(argv[i], "-s") && i+1<argc) strcpy(g_conf.remote_host, argv[++i]);
         else if(!strcmp(argv[i], "-p") && i+1<argc) g_conf.remote_port = atoi(argv[++i]);
@@ -322,6 +347,8 @@ int main(int argc, char **argv) {
         }
         else if(!strcmp(argv[i], "-H") && i+1<argc) strcpy(g_conf.ws_host, argv[++i]);
         else if(!strcmp(argv[i], "-P") && i+1<argc) strcpy(g_conf.ws_path, argv[++i]);
+        else if(!strcmp(argv[i], "--dns1") && i+1<argc) strcpy(g_conf.dns1, argv[++i]);
+        else if(!strcmp(argv[i], "--dns2") && i+1<argc) strcpy(g_conf.dns2, argv[++i]);
     }
     
     if (g_conf.mode == MODE_WSS && strlen(g_conf.ws_host) == 0) strcpy(g_conf.ws_host, g_conf.remote_host);
@@ -343,17 +370,10 @@ int main(int argc, char **argv) {
         SOCKET client = accept(listen_sock, NULL, NULL);
         if (client == INVALID_SOCKET) continue;
         
-        // SOCKS5 握手
-        char b[256];
-        recv(client, b, 2, 0); send(client, "\x05\x00", 2, 0); // Auth
-        recv(client, b, 4, 0); // Request
-        // ... 解析目标地址 (省略详细解析，直接放行) ...
-        send(client, "\x05\x00\x00\x01\0\0\0\0\0\0", 10, 0); // Reply OK
-        
         worker_arg_t *arg = malloc(sizeof(worker_arg_t));
         arg->client = client;
         
-        // 调度
+        // 调度核心：根据 GUI 的指令选择线程
         if (g_conf.mode == MODE_UDP) _beginthreadex(NULL, 0, udp_worker, arg, 0, NULL);
         else _beginthreadex(NULL, 0, wss_worker, arg, 0, NULL);
     }
