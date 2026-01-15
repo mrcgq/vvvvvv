@@ -1,44 +1,49 @@
-name: Build v3 Core
+name: Build v3 Core Universal
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
-  # 任务 1: 编译 Windows 客户端内核 (v3_client.exe)
   build-windows:
     runs-on: windows-latest
+    
+    defaults:
+      run:
+        shell: msys2 {0}
+
     steps:
     - uses: actions/checkout@v3
-    
-    - name: Compile Windows Client
-      # 使用 MinGW gcc，无需配置复杂环境
+
+    # 1. 配置 MSYS2 环境 (这是编译 C 语言神器的关键)
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        # 自动安装 OpenSSL, Libsodium 和 GCC
+        install: >-
+          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-openssl
+          mingw-w64-ucrt-x86_64-libsodium
+
+    # 2. 编译内核 (链接所有需要的库)
+    - name: Compile v3 Core
       run: |
-        gcc -O3 -o v3_client.exe src/v3_core_universal.c -lws2_32
-        
-    - name: Upload Windows Artifact
+        gcc -O3 -static \
+          -o v3_client.exe \
+          src/v3_core_universal.c \
+          -lws2_32 -lssl -lcrypto -lsodium -lcrypt32
+
+    # 3. 验证编译结果 (可选)
+    - name: Verify Build
+      run: |
+        ls -lh v3_client.exe
+
+    # 4. 上传成品
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: v3-client-windows
+        name: v3-core-windows-universal
         path: v3_client.exe
-
-  # 任务 2: 编译 Linux 服务端 (v3_server)
-  build-linux:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v3
-    
-    - name: Install Dependencies
-      run: sudo apt-get update && sudo apt-get install -y liburing-dev libsodium-dev libbpf-dev
-      
-    - name: Compile Linux Server
-      # 开启 AVX2 优化 (GitHub Runner 支持)
-      run: |
-        gcc -O3 -march=x86-64-v3 -o v3_server src/v3_server.c -luring -lsodium -lpthread -lbpf
-
-    - name: Upload Linux Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: v3-server-linux
-        path: v3_server
