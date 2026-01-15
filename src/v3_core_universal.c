@@ -13,6 +13,8 @@
  * gcc -O3 -o v3_client.exe v3_core_universal.c -lws2_32 -lssl -lcrypto
  */
 
+
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +22,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
+
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -31,6 +34,7 @@
 #ifdef ENABLE_WSS
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <sodium.h>        // 加密 需要
 #endif
 
 #pragma comment(lib, "ws2_32.lib")
