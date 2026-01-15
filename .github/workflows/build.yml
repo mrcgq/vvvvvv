@@ -1,0 +1,44 @@
+name: Build v3 Core
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  # 任务 1: 编译 Windows 客户端内核 (v3_client.exe)
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Compile Windows Client
+      # 使用 MinGW gcc，无需配置复杂环境
+      run: |
+        gcc -O3 -o v3_client.exe src/v3_core_universal.c -lws2_32
+        
+    - name: Upload Windows Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: v3-client-windows
+        path: v3_client.exe
+
+  # 任务 2: 编译 Linux 服务端 (v3_server)
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Dependencies
+      run: sudo apt-get update && sudo apt-get install -y liburing-dev libsodium-dev libbpf-dev
+      
+    - name: Compile Linux Server
+      # 开启 AVX2 优化 (GitHub Runner 支持)
+      run: |
+        gcc -O3 -march=x86-64-v3 -o v3_server src/v3_server.c -luring -lsodium -lpthread -lbpf
+
+    - name: Upload Linux Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: v3-server-linux
+        path: v3_server
