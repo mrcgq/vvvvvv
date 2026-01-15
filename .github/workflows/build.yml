@@ -33,7 +33,7 @@ jobs:
       run: |
         gcc -O3 -static \
           -o v3_client.exe \
-          src/v3_core_perfect.c \
+          src/v3_core_universal.c \
           -lssl -lcrypto -lsodium -lws2_32 -lcrypt32 -lgdi32
 
     # 3. 验证编译结果
